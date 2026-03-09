@@ -278,7 +278,7 @@ def plot_results(results):
                 label, va='center', ha='right', fontsize=8, color='white', fontweight='bold')
 
     fig.tight_layout()
-    fig.savefig("/Users/sbae703/Research/ML/bioml/focused_results.png", dpi=150)
+    fig.savefig("focused_results.png", dpi=150)
     print("  Saved focused_results.png")
 
 
