@@ -287,7 +287,8 @@ def run_classification(config_name, cfg, epochs=50, batch_size=32):
 def run_chain_rl(config_name, cfg, length=20, n_ep=600):
     """Run chain MDP. Track per-episode rewards + time-to-first-solve + sustained solve."""
     if cfg is None:
-        agent = BackpropRLAgent(length, 32, 2, lr=0.01, pred_lr=0.02, seed=7)
+        agent = BackpropRLAgent(length, 32, 2, lr=0.01, pred_lr=0.02,
+                                 trace_decay=0.95, entropy_coeff=0.02, seed=7)
     else:
         agent = AblatedBioRLAgent(length, 32, 2, lr=0.01, plateau_gain=3.0,
                                    trace_decay=0.95, pred_lr=0.02, seed=7, **cfg)
@@ -314,7 +315,7 @@ def run_chain_rl(config_name, cfg, length=20, n_ep=600):
                 td_target = r
             else:
                 next_val = agent.predict_value(oh1(s2, length))
-                td_target = r + 0.95 * next_val
+                td_target = r + 0.99 * next_val
 
             agent.learn(td_target, pred_r)
             s = s2
@@ -338,7 +339,8 @@ def run_cartpole_rl(config_name, cfg, n_ep=2000):
     cp_scale = np.array([2.4, 4.0, 0.21, 4.0])
 
     if cfg is None:
-        agent = BackpropRLAgent(4, 64, 2, lr=0.005, pred_lr=0.05, seed=7)
+        agent = BackpropRLAgent(4, 64, 2, lr=0.005, pred_lr=0.05,
+                                 trace_decay=0.9, entropy_coeff=0.01, seed=7)
     else:
         agent = AblatedBioRLAgent(4, 64, 2, lr=0.005, plateau_gain=3.0,
                                    trace_decay=0.9, pred_lr=0.05, seed=7, **cfg)

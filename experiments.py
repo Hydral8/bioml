@@ -422,12 +422,18 @@ class BioRLAgent:
 # ---------------------------------------------------------------------------
 
 class BackpropRLAgent:
-    """Standard REINFORCE with baseline for fair RL comparison."""
+    """Proper actor-critic with TD(λ) eligibility traces, entropy bonus,
+    advantage normalization, and full value gradient through shared weights."""
 
     def __init__(self, state_dim, hidden, n_actions, lr=0.01,
-                 pred_lr=0.01, seed=42):
+                 pred_lr=0.01, seed=42, trace_decay=0.92,
+                 entropy_coeff=0.01, vf_coeff=0.5, max_grad_norm=0.5):
         rng = np.random.RandomState(seed)
         self.lr = lr; self.pred_lr = pred_lr; self.n_actions = n_actions
+        self.trace_decay = trace_decay
+        self.entropy_coeff = entropy_coeff
+        self.vf_coeff = vf_coeff
+        self.max_grad_norm = max_grad_norm
 
         self.W1 = rng.randn(state_dim, hidden) * np.sqrt(2.0/state_dim)
         self.b1 = np.zeros((1, hidden))
@@ -436,7 +442,20 @@ class BackpropRLAgent:
         self.Wr = rng.randn(hidden, 1) * np.sqrt(1.0/hidden)
         self.br = np.zeros((1, 1))
 
-        self.log_grads = []  # store (dW1, db1, dW2, db2) per step
+        # TD(λ) eligibility traces for actor
+        self.e_W1 = np.zeros_like(self.W1)
+        self.e_b1 = np.zeros_like(self.b1)
+        self.e_W2 = np.zeros_like(self.W2)
+        self.e_b2 = np.zeros_like(self.b2)
+        # TD(λ) eligibility traces for critic
+        self.e_Wr = np.zeros_like(self.Wr)
+        self.e_br = np.zeros_like(self.br)
+        self.e_W1v = np.zeros_like(self.W1)
+        self.e_b1v = np.zeros_like(self.b1)
+
+        # Running advantage normalization (mirrors bio's adaptive plateau)
+        self.adv_ema = 0.0
+        self.adv_var_ema = 1.0
 
     def predict_value(self, state):
         z1 = state @ self.W1 + self.b1; h = tanh_act(z1)
@@ -452,33 +471,112 @@ class BackpropRLAgent:
         else:
             action = rng.choice(self.n_actions, p=probs.ravel())
 
-        # Compute and store policy gradient for this step
+        # Policy gradient: grad log pi(a|s) = (one_hot - probs) backpropagated
         oh = np.zeros_like(probs); oh[0, action] = 1.0
-        pe = oh - probs
-        self._last_grad = (
-            state.T @ (pe @ self.W2.T * tanh_deriv(z1)),  # dW1
-            pe @ self.W2.T * tanh_deriv(z1),               # db1
-            h.T @ pe, pe.copy(), h)                        # dW2, db2, h
+        pe = oh - probs  # grad of log pi w.r.t. logits
+
+        # Entropy gradient w.r.t. logits: -sum(p*(log(p)+1)) differentiated
+        # For softmax: d H / d z_i = p_i * (sum_j p_j log p_j) - p_i * log p_i
+        # Simpler: entropy bonus gradient = -(log(probs) + 1) * probs
+        # but through softmax: grad_z = probs * (H_scalar + log(probs))
+        # Actually the gradient of entropy H = -sum(p log p) w.r.t. logits z is:
+        # dH/dz = -p * (log p + 1) + p * sum(p * (log p + 1)) = p * (mean_logp1 - (log p + 1))
+        log_probs = np.log(probs + 1e-12)
+        entropy_grad = -probs * (log_probs + 1)
+        # Through softmax Jacobian: this simplifies to the above for gradient addition
+
+        # Combine: policy grad direction + entropy bonus direction
+        policy_grad_logits = pe + self.entropy_coeff * entropy_grad
+
+        # Backprop through network for policy gradient
+        dW2_policy = h.T @ policy_grad_logits
+        db2_policy = policy_grad_logits.copy()
+        dh_policy = policy_grad_logits @ self.W2.T
+        dz1_policy = dh_policy * tanh_deriv(z1)
+        dW1_policy = state.T @ dz1_policy
+        db1_policy = dz1_policy.copy()
+
+        # Value gradient through shared weights
+        # grad V(s) = grad (h @ Wr + br) w.r.t. all params
+        dh_value = self.Wr.T  # (1, hidden)
+        dz1_value = dh_value * tanh_deriv(z1)
+        dW1_value = state.T @ dz1_value
+        db1_value = dz1_value.copy()
+        dWr_value = h.T  # (hidden, 1)
+        dbr_value = np.ones((1, 1))
+
+        # Accumulate eligibility traces (TD(λ))
+        self.e_W2 = self.trace_decay * self.e_W2 + dW2_policy
+        self.e_b2 = self.trace_decay * self.e_b2 + db2_policy
+        self.e_W1 = self.trace_decay * self.e_W1 + dW1_policy
+        self.e_b1 = self.trace_decay * self.e_b1 + db1_policy
+
+        self.e_Wr = self.trace_decay * self.e_Wr + dWr_value
+        self.e_br = self.trace_decay * self.e_br + dbr_value
+        self.e_W1v = self.trace_decay * self.e_W1v + dW1_value
+        self.e_b1v = self.trace_decay * self.e_b1v + db1_value
+
+        self.last_h = h
+        self.last_z1 = z1
+        self.last_state = state
+
         return action, pred_r
 
+    def _clip_grad(self, *grads):
+        """Clip gradient norm across all parameter arrays."""
+        total_norm = np.sqrt(sum(np.sum(g**2) for g in grads))
+        if total_norm > self.max_grad_norm:
+            scale = self.max_grad_norm / (total_norm + 1e-8)
+            return tuple(g * scale for g in grads), total_norm
+        return grads, total_norm
+
     def learn(self, td_target, pred_reward):
-        """Online actor-critic update with TD error."""
-        rpe = td_target - pred_reward
-        rpe = np.clip(rpe, -2.0, 2.0)
-        if hasattr(self, '_last_grad'):
-            dW1, db1, dW2, db2, h = self._last_grad
-            self.W2 += self.lr * rpe * dW2
-            self.b2 += self.lr * rpe * db2
-            self.W1 += self.lr * rpe * dW1
-            self.b1 += self.lr * rpe * db1
-            # Update value baseline
-            pred_error = np.clip(td_target - (h @ self.Wr + self.br), -2.0, 2.0)
-            self.Wr += self.pred_lr * h.T * pred_error
-            self.br += self.pred_lr * pred_error
-        return rpe
+        """Online actor-critic update with TD(λ) traces."""
+        delta = td_target - pred_reward
+        delta = np.clip(delta, -5.0, 5.0)
+
+        # Advantage normalization (running stats, mirrors bio's adaptive plateau)
+        self.adv_ema = 0.99 * self.adv_ema + 0.01 * delta
+        self.adv_var_ema = 0.99 * self.adv_var_ema + 0.01 * (delta - self.adv_ema)**2
+        adv_std = np.sqrt(self.adv_var_ema + 1e-8)
+        norm_delta = delta / adv_std
+
+        # Policy update: lr * normalized_advantage * eligibility_trace
+        pg_W2 = self.lr * norm_delta * self.e_W2
+        pg_b2 = self.lr * norm_delta * self.e_b2
+        pg_W1 = self.lr * norm_delta * self.e_W1
+        pg_b1 = self.lr * norm_delta * self.e_b1
+
+        # Value update: pred_lr * delta * value_eligibility_trace
+        vg_Wr = self.pred_lr * delta * self.e_Wr
+        vg_br = self.pred_lr * delta * self.e_br
+        vg_W1 = self.vf_coeff * self.pred_lr * delta * self.e_W1v
+        vg_b1 = self.vf_coeff * self.pred_lr * delta * self.e_b1v
+
+        # Gradient clipping on combined updates
+        all_grads = (pg_W1, pg_b1, pg_W2, pg_b2, vg_W1, vg_b1, vg_Wr, vg_br)
+        clipped, _ = self._clip_grad(*all_grads)
+        pg_W1, pg_b1, pg_W2, pg_b2, vg_W1, vg_b1, vg_Wr, vg_br = clipped
+
+        # Apply policy updates
+        self.W2 += pg_W2
+        self.b2 += pg_b2
+        self.W1 += pg_W1
+        self.b1 += pg_b1
+
+        # Apply value updates (including shared layer)
+        self.Wr += vg_Wr
+        self.br += vg_br
+        self.W1 += vg_W1
+        self.b1 += vg_b1
+
+        return delta
 
     def reset_traces(self):
-        pass
+        self.e_W1 *= 0; self.e_b1 *= 0
+        self.e_W2 *= 0; self.e_b2 *= 0
+        self.e_Wr *= 0; self.e_br *= 0
+        self.e_W1v *= 0; self.e_b1v *= 0
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +799,8 @@ def run_bandit(n_steps=3000, k=10, pev=500):
 
 def run_chain(length=20, n_ep=800, pev=100):
     agents = {
-        "Backprop": BackpropRLAgent(length, 32, 2, lr=0.01, pred_lr=0.02, seed=7),
+        "Backprop": BackpropRLAgent(length, 32, 2, lr=0.01, pred_lr=0.02,
+                                     trace_decay=0.95, entropy_coeff=0.02, seed=7),
         "Bio":      BioRLAgent(length, 32, 2, lr=0.01, plateau_gain=3.0,
                                 trace_decay=0.95, pred_lr=0.02, seed=7),
     }
@@ -709,14 +808,15 @@ def run_chain(length=20, n_ep=800, pev=100):
         env_fn=lambda: ChainMDP(length=length, slip=0.1, seed=0),
         state_fn=lambda s: one_hot(s, length),
         n_episodes=n_ep, max_steps=length*5,
-        eps_start=0.3, eps_end=0.05, print_every=pev, gamma=0.95)
+        eps_start=0.3, eps_end=0.05, print_every=pev, gamma=0.99)
 
 
 def run_cartpole(n_ep=1000, pev=100):
     # Normalize CartPole state to similar scales
     cp_scale = np.array([2.4, 4.0, 0.21, 4.0])
     agents = {
-        "Backprop": BackpropRLAgent(4, 32, 2, lr=0.001, pred_lr=0.1, seed=7),
+        "Backprop": BackpropRLAgent(4, 32, 2, lr=0.001, pred_lr=0.1,
+                                     trace_decay=0.9, entropy_coeff=0.01, seed=7),
         "Bio":      BioRLAgent(4, 32, 2, lr=0.001, plateau_gain=3.0,
                                 trace_decay=0.8, pred_lr=0.1, seed=7),
     }
